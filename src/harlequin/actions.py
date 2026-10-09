@@ -68,6 +68,12 @@ HARLEQUIN_ACTIONS = {
         target=None,
         action="toggle_full_screen",
     ),
+    "toggle_resize_mode": Action(
+        target=None,
+        action="toggle_resize_mode",
+        description="Resize Panels",
+        priority=True,
+    ),
     "show_debug_info": Action(
         target=None,
         action="show_debug_info",

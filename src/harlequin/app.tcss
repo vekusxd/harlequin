@@ -35,6 +35,14 @@ HistoryScreen QueryPreview:focus-within {
     border-title-color: $border-title-color-focus;
 }
 
+/* The panels whose divider resize mode, a drag or a hover is acting on. */
+DataCatalog.-resize-target,
+EditorCollection.-resize-target,
+ResultsViewer.-resize-target {
+    border: double $accent;
+    border-title-color: $accent;
+}
+
 CodeEditor:disabled,
 Container:disabled,
 DataCatalog:disabled,
