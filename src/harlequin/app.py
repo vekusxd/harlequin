@@ -21,8 +21,9 @@ from typing import (
     Union,
 )
 
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import DOMQuery
 from textual.dom import DOMNode
@@ -103,6 +104,16 @@ from harlequin.messages import NewCatalog, NewCatalogItems, WidgetMounted
 from harlequin.plugins import load_keymap_plugins
 from harlequin.query import ExecutedStatement, ResultSet, RowLimit, execute, fetch
 from harlequin.query_log import UI_BUSY_TIMEOUT_MS, QueryLog
+from harlequin.resizing import (
+    SPLIT_DEFAULT,
+    ResizeTarget,
+    clamp_sidebar_width,
+    clamp_split,
+    on_sidebar_edge,
+    on_split_edge,
+    sidebar_width_at,
+    split_at,
+)
 from harlequin.statements import Statement
 from harlequin.transaction_mode import HarlequinTransactionMode
 from harlequin.windows_timezone import (
@@ -282,8 +293,49 @@ class Harlequin(AppBase):
 
     CSS_PATH = ["global.tcss", "app.tcss"]
 
+    # Resize mode keys. Resize mode clears focus and these are priority bindings,
+    # so they get the keys first; outside resize mode check_action disables them
+    # and the keys keep their usual meaning.
+    BINDINGS = [
+        Binding(
+            "h,left,k,up",
+            "resize_step(-1)",
+            "Shrink",
+            key_display="h/k",
+            priority=True,
+        ),
+        Binding(
+            "l,right,j,down",
+            "resize_step(1)",
+            "Grow",
+            key_display="l/j",
+            priority=True,
+        ),
+        Binding("H,K", "resize_step(-5)", "Shrink More", show=False, priority=True),
+        Binding("L,J", "resize_step(5)", "Grow More", show=False, priority=True),
+        Binding(
+            "tab,shift+tab",
+            "resize_switch_target",
+            "Other Divider",
+            key_display="tab",
+            priority=True,
+        ),
+        Binding("equals_sign", "resize_reset", "Reset", key_display="=", priority=True),
+        Binding(
+            "escape,enter", "exit_resize_mode", "Done", key_display="esc", priority=True
+        ),
+    ]
+
     full_screen: reactive[bool] = reactive(False)
     sidebar_hidden: reactive[bool] = reactive(False)
+    resize_mode: reactive[bool] = reactive(False, init=False, bindings=True)
+    """True while the keyboard moves the panel dividers."""
+    resize_target: reactive[ResizeTarget] = reactive("sidebar", init=False)
+    """The divider that resize mode moves."""
+    sidebar_width: reactive[int | None] = reactive(None, init=False)
+    """The Data Catalog's width in cells, or None for the stylesheet's width."""
+    split_percent: reactive[float] = reactive(SPLIT_DEFAULT, init=False)
+    """The Query Editor's share of the editor/results split, in percent."""
 
     def __init__(
         self,
@@ -483,6 +535,13 @@ class Harlequin(AppBase):
 
     async def on_mount(self) -> None:
         self.run_query_bar.apply_configured_limit()
+
+        self._dragging: ResizeTarget | None = None
+        self._focus_before_resize: Widget | None = None
+        # The stylesheet hides a disabled panel by shrinking it to zero, which an
+        # inline size would override, so sizes are reapplied whenever one toggles.
+        for panel in (self.data_catalog, self.editor_collection, self.results_viewer):
+            self.watch(panel, "disabled", self._apply_panel_sizes, init=False)
 
         if self.ssh_tunnel is not None:
             # which database this session is actually looking at
@@ -974,6 +1033,194 @@ class Harlequin(AppBase):
             for w in all_widgets:
                 w.disabled = False
             self.data_catalog.disabled = self.sidebar_hidden
+
+    def _resize_targets(self) -> list[ResizeTarget]:
+        """The dividers that are currently on screen."""
+        targets: list[ResizeTarget] = []
+        if not self.data_catalog.disabled:
+            targets.append("sidebar")
+        if (
+            self.editor is not None
+            and not self.editor_collection.disabled
+            and not self.results_viewer.disabled
+        ):
+            targets.append("split")
+        return targets
+
+    def _highlight_resize_target(self, target: ResizeTarget | None) -> None:
+        self.data_catalog.set_class(target == "sidebar", "-resize-target")
+        self.editor_collection.set_class(target == "split", "-resize-target")
+        self.results_viewer.set_class(target == "split", "-resize-target")
+
+    def _apply_panel_sizes(self) -> None:
+        catalog = self.data_catalog
+        if catalog.disabled or self.sidebar_width is None:
+            catalog.styles.width = None
+        else:
+            catalog.styles.width = self.sidebar_width
+        editor_collection, results_viewer = self.editor_collection, self.results_viewer
+        if (
+            self.split_percent == SPLIT_DEFAULT
+            or editor_collection.disabled
+            or results_viewer.disabled
+        ):
+            editor_collection.styles.height = None
+            results_viewer.styles.height = None
+        else:
+            editor_collection.styles.height = f"{self.split_percent}fr"
+            results_viewer.styles.height = f"{100 - self.split_percent}fr"
+
+    def watch_sidebar_width(self) -> None:
+        self._apply_panel_sizes()
+
+    def watch_split_percent(self) -> None:
+        self._apply_panel_sizes()
+
+    def watch_resize_mode(self, active: bool) -> None:
+        self._highlight_resize_target(self.resize_target if active else None)
+        # A focused editor or input would take h/j/k/l as text, so focus is parked
+        # while resize mode is active and given back afterwards.
+        if active:
+            self._focus_before_resize = self.focused
+            self.screen.set_focus(None)
+        else:
+            previous, self._focus_before_resize = self._focus_before_resize, None
+            if previous is not None and previous.is_attached and previous.focusable:
+                previous.focus()
+
+    def watch_resize_target(self, target: ResizeTarget) -> None:
+        if self.resize_mode:
+            self._highlight_resize_target(target)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {
+            "resize_step",
+            "resize_switch_target",
+            "resize_reset",
+            "exit_resize_mode",
+        }:
+            return self.resize_mode and len(self.screen_stack) == 1
+        return super().check_action(action, parameters)
+
+    def action_toggle_resize_mode(self) -> None:
+        if self.resize_mode:
+            self.resize_mode = False
+            return
+        if len(self.screen_stack) > 1:
+            return
+        targets = self._resize_targets()
+        if not targets:
+            self.notify("Nothing to resize.", severity="warning", timeout=2)
+            return
+        focused_target: ResizeTarget | None = None
+        if self.focused is not None:
+            focused_ancestors = self.focused.ancestors_with_self
+            if self.data_catalog in focused_ancestors:
+                focused_target = "sidebar"
+            elif (
+                self.editor_collection in focused_ancestors
+                or self.results_viewer in focused_ancestors
+            ):
+                focused_target = "split"
+        if focused_target in targets:
+            self.resize_target = focused_target
+        elif self.resize_target not in targets:
+            self.resize_target = targets[0]
+        self.resize_mode = True
+
+    def action_exit_resize_mode(self) -> None:
+        self.resize_mode = False
+
+    @on(events.DescendantFocus)
+    def end_resize_mode_on_focus(self) -> None:
+        # Focusing something, e.g. by clicking it, ends resize mode and keeps
+        # the new focus.
+        if self.resize_mode:
+            self._focus_before_resize = None
+            self.resize_mode = False
+
+    def action_resize_switch_target(self) -> None:
+        targets = self._resize_targets()
+        if not targets:
+            self.resize_mode = False
+        elif self.resize_target in targets:
+            index = targets.index(self.resize_target)
+            self.resize_target = targets[(index + 1) % len(targets)]
+        else:
+            self.resize_target = targets[0]
+
+    def action_resize_step(self, steps: int) -> None:
+        """Move the selected divider by `steps`; negative moves it left or up."""
+        if self.resize_target not in self._resize_targets():
+            self.action_resize_switch_target()
+            if not self.resize_mode:
+                return
+        if self.resize_target == "sidebar":
+            self.sidebar_width = clamp_sidebar_width(
+                self.data_catalog.outer_size.width + 2 * steps,
+                self.screen.size.width,
+            )
+        else:
+            self.split_percent = clamp_split(self.split_percent + 2 * steps)
+
+    def action_resize_reset(self) -> None:
+        if self.resize_target == "sidebar":
+            self.sidebar_width = None
+        else:
+            self.split_percent = SPLIT_DEFAULT
+
+    def _resize_target_at(self, x: int, y: int) -> ResizeTarget | None:
+        """The divider whose border is under the pointer, if any."""
+        targets = self._resize_targets()
+        if "sidebar" in targets and on_sidebar_edge(x, y, self.data_catalog.region):
+            return "sidebar"
+        if "split" in targets and on_split_edge(
+            x, y, self.editor_collection.region, self.results_viewer.region
+        ):
+            return "split"
+        return None
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if event.button != 1 or len(self.screen_stack) > 1:
+            return
+        target = self._resize_target_at(event.screen_x, event.screen_y)
+        if target is None:
+            return
+        event.stop()
+        event.prevent_default()
+        self._dragging = target
+        self._highlight_resize_target(target)
+        self.capture_mouse(self.screen)
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._dragging is None:
+            if not self.resize_mode and len(self.screen_stack) == 1:
+                self._highlight_resize_target(
+                    self._resize_target_at(event.screen_x, event.screen_y)
+                )
+            return
+        event.stop()
+        if self._dragging == "sidebar":
+            self.sidebar_width = clamp_sidebar_width(
+                sidebar_width_at(event.screen_x, self.data_catalog.region),
+                self.screen.size.width,
+            )
+        else:
+            self.split_percent = clamp_split(
+                split_at(
+                    event.screen_y,
+                    self.editor_collection.region,
+                    self.results_viewer.region,
+                )
+            )
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._dragging is None:
+            return
+        event.stop()
+        self._dragging = None
+        self.capture_mouse(None)
+        self._highlight_resize_target(self.resize_target if self.resize_mode else None)
 
     @on(QuerySubmitted)
     def execute_query(self, message: QuerySubmitted) -> None:

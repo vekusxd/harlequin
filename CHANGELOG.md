@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- The Data Catalog's width and the split between the Query Editor and the Results Viewer can be changed by dragging their borders, or in resize mode: press `ctrl+shift+r` (action `toggle_resize_mode`), then `h`/`j`/`k`/`l` to move the divider (`H`/`J`/`K`/`L` for bigger steps), `tab` to pick the other divider, `=` to reset it, and `esc` to leave.
+
 ## [2.16.1] - 2026-10-01
 
 ### Bug Fixes
