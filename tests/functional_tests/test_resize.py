@@ -3,7 +3,8 @@ from typing import Awaitable, Callable
 import pytest
 
 from harlequin import Harlequin
-from harlequin.resizing import SPLIT_DEFAULT
+from harlequin.components import KeysPanel
+from harlequin.resizing import SIDEBAR_MIN_REMAINING, SPLIT_DEFAULT
 from tests.functional_tests.helpers import wait_for_editor
 
 SIZE = (120, 40)
@@ -174,3 +175,21 @@ async def test_focusing_a_widget_ends_resize_mode(
         assert not app.resize_mode
         assert app.focused is not None
         assert editor is not None
+
+
+@pytest.mark.asyncio
+async def test_sidebar_leaves_room_for_the_main_panel_beside_the_keys_panel(
+    app: Harlequin,
+    wait_for_workers: Callable[[Harlequin], Awaitable[None]],
+) -> None:
+    async with app.run_test(size=SIZE) as pilot:
+        await wait_for_workers(app)
+        await wait_for_editor(pilot, app)
+        app.data_catalog.focus()
+        await pilot.press("f7")
+        await pilot.pause()
+        assert app.screen.query(KeysPanel)
+        await pilot.press("ctrl+shift+r", *["L"] * 20)
+        await pilot.pause()
+        main_panel = app.query_one("#main_panel")
+        assert main_panel.outer_size.width >= SIDEBAR_MIN_REMAINING

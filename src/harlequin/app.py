@@ -1034,6 +1034,16 @@ class Harlequin(AppBase):
                 w.disabled = False
             self.data_catalog.disabled = self.sidebar_hidden
 
+    def _sidebar_and_main_panel_width(self) -> int:
+        """Cells the Data Catalog shares with the main panel, net of other columns
+        in their row, like the Keys panel."""
+        other_columns_width = sum(
+            column.outer_size.width
+            for column in self.main_row.children
+            if column is not self.data_catalog and column.id != "main_panel"
+        )
+        return self.main_row.size.width - other_columns_width
+
     def _resize_targets(self) -> list[ResizeTarget]:
         """The dividers that are currently on screen."""
         targets: list[ResizeTarget] = []
@@ -1158,7 +1168,7 @@ class Harlequin(AppBase):
         if self.resize_target == "sidebar":
             self.sidebar_width = clamp_sidebar_width(
                 self.data_catalog.outer_size.width + 2 * steps,
-                self.screen.size.width,
+                self._sidebar_and_main_panel_width(),
             )
         else:
             self.split_percent = clamp_split(self.split_percent + 2 * steps)
@@ -1203,7 +1213,7 @@ class Harlequin(AppBase):
         if self._dragging == "sidebar":
             self.sidebar_width = clamp_sidebar_width(
                 sidebar_width_at(event.screen_x, self.data_catalog.region),
-                self.screen.size.width,
+                self._sidebar_and_main_panel_width(),
             )
         else:
             self.split_percent = clamp_split(
